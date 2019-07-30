@@ -755,3 +755,382 @@ inflacao_long %>%
        caption = "IBGE")+
   # Alterar a posição da legenda
   theme(legend.position = "bottom")
+
+
+# Armazenar informação em um objeto
+renda_domiciliar <- pdad_2018_moradores %>%
+  # Vamos mudar para ausente os valores das variáveis G16,G19,G201 até G204
+  # com códigos 77777 ou 88888.
+  # Vamos também mudar para 0 quando os valores que não se aplicarem
+  # ou não forem observados rendimentos
+  dplyr::mutate_at(vars(G16,G19,G201:G204), # Variáveis a serem alteradas
+                   # Função a ser aplicada
+                   list(M=~case_when(. %in% c(77777,88888)~NA_real_,
+                                     . %in% c(66666,99999)~0,
+                                     TRUE~as.numeric(.)))) %>%
+  # Selecionar apenas as variáveis de interesse
+  dplyr::select(A01nFicha,E02,G16,G19,G201:G204,G16_M:G204_M) %>%
+  # Somar as variáveis modificadas para construir a renda individual
+  dplyr::mutate(renda_individual=rowSums(.[,c("G16_M","G19_M",
+                                              "G201_M","G202_M",
+                                              "G203_M","G204_M")],na.rm = F)) %>%
+  # Desconsiderar os empregados domesticos moradores e seus parentes
+  dplyr::filter(!E02 %in% c(16,17,18)) %>%
+  # Agrupar por domicílio
+  dplyr::group_by(A01nFicha) %>%
+  # Somar os valores por domicílios
+  dplyr::summarise(renda_dom=sum(renda_individual, na.rm = F),
+                   # Construir o número de pessoas no domicílio, por esse critério de rendimento
+                   pessoas=n(),
+                   # Calcular a renda domiciliar per capita
+                   renda_dom_pc=renda_dom/pessoas)
+
+
+mean(renda_domiciliar$renda_dom, na.rm=T)
+
+
+# Consultar o índice das colunas de mesmo nome entre as bases
+x <-
+  which((names(pdad_2018_domicilios) %in% names(pdad_2018_moradores)))
+
+# Verificar quais são as colunas
+names(pdad_2018_domicilios)[x]
+
+# Fazer o join das bases
+pdad <- pdad_2018_moradores %>%
+  # Entrar com a função para left join
+  dplyr::left_join(
+    # Informar a base que iremos unir, filtrando para colunas repetidas
+    pdad_2018_domicilios %>%
+      dplyr::select(-c(A01ra,FATOR_PROJ)))
+
+
+
+# Fazer o join das bases
+pdad <- pdad_2018_moradores %>%
+  # Entrar com a função para left join
+  dplyr::left_join(
+    # Informar a base que iremos unir, filtrando para colunas repetidas
+    pdad_2018_domicilios %>%
+      # Filtrar as colunas repetidas
+      dplyr::select(-c(A01ra,FATOR_PROJ)),
+    by=c("A01nFicha"="A01nFicha"))
+
+
+pdad <- pdad %>%
+  dplyr::mutate(datavisita=lubridate::mdy(datavisita),
+                # Extrair o valor do mês
+                mes=lubridate::month(datavisita,label=F),
+                # Extratir o valor do ano
+                ano=lubridate::year(datavisita)) %>%
+  # Trazer as informações de renda
+  dplyr::left_join(renda_domiciliar) %>%
+  # Trazer as infomações de inflação
+  dplyr::left_join(inflacao_df) %>%
+  # Criar as variáveis monetárias em termos reais
+  dplyr::mutate(renda_dom_real=renda_dom*inflator,
+                renda_dom_pc_real=renda_dom_pc*inflator)
+
+
+# Carregar os pacotes necessários
+library(survey)
+library(srvyr)
+
+# Declarar o desenho incial
+sample.pdad <- 
+  survey::svydesign(id = ~A01nFicha, # Identificador único da unidade amostrada
+                    strata = ~A01setor, # Identificação do estrato
+                    weights = ~PESO_PRE, # Probabilidade da unidade ser sorteada
+                    nest=TRUE, # Parâmetro de tratamento para dos IDs dos estratos
+                    data=pdad # Declarar a base a ser utilizada
+  )
+
+# Criar um objeto para pós estrato
+post.pop <- pdad %>%
+  dplyr::group_by(POS_ESTRATO) %>% # Agrupar por pos-estrato
+  dplyr::summarise(Freq=max(POP_AJUSTADA_PROJ)) # Capturar o total da população
+
+# Declarar o objeto de pós-estrato
+# Estamos dizendo nesse passo qual é a população alvo para cada
+# pós-estrato considerado
+sample.pdad <- survey::postStratify(sample.pdad,~POS_ESTRATO,post.pop)
+
+# Criar objeto para calcular os erros por bootstrap (Rao and Wu’s(n − 1) bootstrap)
+# J. N. K. Rao and C. F. J. Wu - Journal of the American Statistical Association
+# Vol. 83, No. 401 (Mar., 1988), pp. 231-241
+amostra <- survey::as.svrepdesign(sample.pdad, type = "subbootstrap")
+
+# Ajustar estratos com apenas uma UPA (adjust=centered)
+options( survey.lonely.psu = "adjust")
+
+# Ajustar objeto de amostra, para uso com o pacote srvyr
+amostra <- srvyr::as_survey(amostra)
+
+
+
+# População DF com mais de 18 anos
+pop18 <- 
+  amostra %>%
+  # Filtrar somente a população com 18 anos ou mais de idade
+  srvyr::filter(idade_calculada>=18) %>%
+  # Criar uma variável auxiliar para contagem
+  srvyr::mutate(count=1) %>%
+  # Calcular o total da população, com seu intervalo de confiança
+  srvyr::summarise(n=survey_total(count, vartype = "ci"))
+
+
+amostra %>%
+  # Filtrar somente a população com 18 anos ou mais de idade, retirando os códigos de não informação
+  srvyr::filter(idade_calculada>=18) %>%
+  # Ajustar a variável de sexo
+  srvyr::mutate(E03=factor(case_when(E03==1~"Masculino",
+                                     TRUE~"Feminino"))) %>%
+  # Informar o grupo que queremos a informação
+  srvyr::group_by(E03) %>%
+  # Calcular o total e o Percentual da população, com seu intervalo de confiança
+  srvyr::summarise(n=survey_total(vartype = "ci"),
+                   # Calcular o percentual da população
+                   pct=survey_mean(vartype = "ci"))
+
+
+amostra %>%
+  # Filtrar somente para informações do chefe, cujo peso é utilizado para 
+  # expandir os resultados de domicílio
+  srvyr::filter(E02==1)%>%
+  # Calcular a renda domiciliar real média do DF
+  srvyr::summarise(renda_dom_real=survey_mean(renda_dom_real,na.rm=T,vartype="ci"),
+                   renda_dom=survey_mean(renda_dom,na.rm=T,vartype="ci"))
+
+
+
+# Criar um objeto com o salário mínimo em 2018
+sm <- 954
+
+# Criar um objeto com as variáveis de interesse
+vars_relatorio <- amostra %>%
+  # Criar variável de sexo
+  srvyr::mutate(sexo=case_when(E03==1~"Masculino",
+                               E03==2~"Feminino"),
+                # Criar variável de esgotamento sanitário
+                esgotamento_caesb=case_when(B151==1~"Com Rede Geral (Caesb)",
+                                            TRUE~"Sem Rede Geral (Caesb)"),
+                # Criar variável de faixas de idade
+                idade_faixas=cut(idade_calculada,
+                                 breaks = c(-Inf,seq(4,84,by=5),Inf),
+                                 labels = c("0 a 4 anos","5 a 9 anos",
+                                            "10 a 14 anos","15 a 19 anos",
+                                            "20 a 24 anos","25 a 29 anos",
+                                            "30 a 34 anos","35 a 39 anos",
+                                            "40 a 44 anos","45 a 49 anos",
+                                            "50 a 54 anos","55 a 59 anos",
+                                            "60 a 64 anos","65 a 69 anos",
+                                            "70 a 74 anos","75 a 79 anos",
+                                            "80 a 84 anos","Mais de 85 anos"),
+                                 ordered_result = T),
+                # Criar variável de faixas de salário do trabalho principal
+                faixas_salario=cut(case_when(G16 %in% c(77777,88888,99999)~NA_real_,
+                                             TRUE~as.numeric(G16)),
+                                   breaks = c(-Inf,sm,2*sm,4*sm,10*sm,20*sm,Inf),
+                                   labels = c("Até 1 salário","Mais de 1 até 2 salários",
+                                              "Mais de 2 até 4 salários",
+                                              "Mais de 4 até 10 salários",
+                                              "Mais de 10 até 20 salários",
+                                              "Mais de 20 salários")),
+                # Criar variável para as RAs
+                RA=factor(A01ra,
+                          levels=1:31,
+                          labels=c('Plano Piloto',      
+                                   'Gama',
+                                   'Taguatinga',
+                                   'Brazlândia',
+                                   'Sobradinho',
+                                   'Planaltina',
+                                   'Paranoá',
+                                   'Núcleo Bandeirante',
+                                   'Ceilândia',
+                                   'Guará',
+                                   'Cruzeiro',
+                                   'Samambaia',
+                                   'Santa Maria',
+                                   'São Sebastião',
+                                   'Recanto das Emas',
+                                   'Lago Sul',
+                                   'Riacho Fundo',
+                                   'Lago Norte',
+                                   'Candangolândia',
+                                   'Águas Claras',
+                                   'Riacho Fundo II',
+                                   'Sudoeste/Octogonal',
+                                   'Varjão',
+                                   'Park Way',
+                                   'SCIA-Estrutural',
+                                   'Sobradinho II',
+                                   'Jardim Botânico',
+                                   'Itapoã',
+                                   'SIA',
+                                   'Vicente Pires',
+                                   'Fercal'))) %>%
+  # Transformar em fator variáveis do tipo character
+  srvyr::mutate_if(is.character,list(~factor(.))) %>%
+  # Selecionar as variáveis criadas e algumas variáveis auxiliares
+  srvyr::select(RA,E02,idade_calculada,G05,sexo,esgotamento_caesb,idade_faixas,faixas_salario)
+
+
+
+# Construir um objeto com as idades calculadas, por faixas de idade e sexo
+# para montarmos a pirâmide etária
+piramide <-
+  vars_relatorio %>%
+  # Agrupar por faixas de idade e sexo
+  srvyr::group_by(idade_faixas,sexo) %>%
+  # Calcular os totais
+  srvyr::summarise(n=survey_total(na.rm = T, vartype = "ci"))
+
+# Fazer o gráfico com a pirâmide
+piramide_grafico <-
+  piramide %>%
+  # Construir um plot com as idades no eixo x, as quantidades no eixo y,
+  #  preenchimento com a variável sexo, e os intervalos de confiança
+  # inferiores e superiores
+  ggplot(aes(x=idade_faixas,y=n, fill=sexo, ymin=n_low,ymax=n_upp))+
+  # Fazer o gráfico de barras para o sexo Feminino
+  geom_bar(data = dplyr::filter(piramide, sexo == "Feminino"),
+           stat = "identity") +
+  # Fazer o gráfico de barras para o sexo Masculino
+  geom_bar(data = dplyr::filter(piramide, sexo == "Masculino"),
+           stat = "identity",
+           position = "identity",
+           # Negativar os valores para espelhar no eixo
+           mapping = aes(y = -n))+
+  # Plotar os erros para o sexo Masculino, negativando os valores para espelhar o eixo
+  geom_errorbar(data = dplyr::filter(piramide, sexo == "Masculino"),
+                mapping = aes(ymin = -n_low,ymax=-n_upp),
+                width=0,
+                color="black")+
+  # Plotar os erros para o sexo Feminino
+  geom_errorbar(data = dplyr::filter(piramide, sexo == "Feminino"),
+                width=0,
+                color="black")+
+  # Inverter os eixos, fazendo com que o gráfico de colunas verticais fique
+  # horizontal
+  coord_flip() + 
+  # Ajustar as configurações de escala
+  scale_y_continuous(labels = function(x) format(abs(x), 
+                                                 big.mark = ".",
+                                                 scientific = FALSE,
+                                                 decimal.mark=",")) +
+  # Suprimir os nomes dos eixos
+  labs(x="",y="") +
+  # Suprimir o nome da legenda
+  scale_fill_discrete(name = "")
+
+# Plotar gráfico
+piramide_grafico
+
+
+
+# Construir um objeto com as informações de salário
+salario <- vars_relatorio %>%
+  # Agrupar por faixas de salário
+  srvyr::group_by(faixas_salario) %>%
+  # Calcular os totais para cada grupo de salário
+  srvyr::summarise(n=survey_total(na.rm=T,vartype = "ci"))
+
+# Construir um objeto com o gráfico
+salario_grafico <-
+  salario %>%
+  # Plotar os eixos x e y
+  ggplot(aes(x=faixas_salario, y=n))+
+  # Construir o gráfico de barras
+  geom_bar(stat = "identity") +
+  # Construir as barras de erro
+  geom_errorbar(aes(ymin=n_low,ymax=n_upp,size=4, width=0), color="darkred")+
+  # Inverter os eixos
+  coord_flip()+
+  # Suprimir o nome dos eixos
+  labs(x="",y="")+
+  # Retirar o título da legenda
+  theme(legend.position="none")+
+  # Ajustar as formatações de escala
+  scale_y_continuous(labels = function(x) format(abs(x), 
+                                                 big.mark = ".",
+                                                 scientific = FALSE,
+                                                 decimal.mark=","))
+
+# Plotar gráfico
+salario_grafico
+
+
+
+# Carregar o pacote Scales
+library(scales)
+
+# Construir o objeto com os valores
+salario2 <- vars_relatorio %>%
+  # Agrupar por RA e faixas de salário
+  srvyr::group_by(RA,faixas_salario) %>%
+  # Calcular as proporções por faixa de salário
+  srvyr::summarise(n=survey_mean(na.rm=T,vartype = "ci"))
+
+# Construir o gráfico
+salario2 %>%
+  # Plotar os eixos x e y
+  ggplot(aes(x=faixas_salario, y=n))+
+  # Construir o gráfico de barras
+  geom_bar(stat = "identity") +
+  # Construir o gráfico com os erros
+  geom_errorbar(aes(ymin=n_low,ymax=n_upp,size=4, width=0,group=RA), color="darkred")+
+  # Inverter os eixos
+  coord_flip()+
+  # Suprimir o nome dos eixos
+  labs(x="",y="")+
+  # Suprimir o nome da legenda
+  theme(legend.position="none")+
+  # Ajustar as formatações de escala
+  scale_y_continuous(labels = scales::percent)+
+  # Plotar o gráfico para cada uma das RAs, divididas em 4 colunas
+  facet_wrap(.~RA, ncol=4)
+
+
+
+# Construir o objeto com o esgotamento sanitário
+esgotamento <- vars_relatorio %>%
+  # Filtrar para as informações somente do responsável (1 obs. por domicílio)
+  srvyr::filter(E02==1) %>%
+  # Agrupar por situação de esgotamento sanitário
+  srvyr::group_by(esgotamento_caesb) %>%
+  # Calcular a proporção de cada grupo
+  srvyr::summarise(n=survey_mean(na.rm = T,vartype = "ci"))
+
+# Construir o objeto com o gráfico
+esgotamento_grafico <-
+  esgotamento %>%
+  # Plotar os eixos x e y, reordenando os fatores, do maior para o menor resultado
+  ggplot(aes(x=fct_reorder(esgotamento_caesb,-n),y=n,ymin=n_low,ymax=n_upp))+
+  # Construir o gráfico de barras
+  geom_bar(stat = "identity")+
+  # Construir os erros
+  geom_errorbar(size=4, width=0,
+                color="black")+
+  # Ajustar os nomes dos eixos
+  labs(x="",y="% Domicílios")+
+  # Retirar o nome da legenda
+  theme(legend.position="none")+
+  # Ajustar a formatação dos rótulos
+  scale_y_continuous(labels = scales::percent)+
+  # Inserir informações dos resultados no gráfico
+  geom_text(aes(label = paste0(round(100*n,0),"%")),
+            size=4, fontface = "bold", 
+            vjust = -0.25,hjust=1.25)
+
+# Plotar grafico
+esgotamento_grafico
+
+
+
+# Salvar um arquivo com todos os objetos
+save.image("objetos.rda", compress = T)
+# Remover todos os objetos do ambiente
+# rm(list = ls())
+# Carregar os objetos salvos
+load("objetos.rda")
